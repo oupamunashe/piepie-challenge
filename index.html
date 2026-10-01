@@ -283,13 +283,7 @@
           <div id="profile-avatar" class="w-10 h-10 rounded-full bg-[#0F0C20] text-white flex items-center justify-center font-display font-bold text-sm">AM</div>
         </div>
 
-        <div id="account-status" class="flex items-center justify-between gap-2 bg-slate-50 border border-slate-200 rounded-lg px-3 py-2.5">
-          <div class="flex items-center gap-1.5 min-w-0">
-            <span id="account-status-icon" class="material-symbols-outlined text-[16px] text-slate-500 shrink-0">cloud_off</span>
-            <span id="account-status-text" class="text-xs font-semibold text-slate-600 truncate">Local device only</span>
-          </div>
-          <button id="btn-account-action" type="button" class="text-[11px] font-bold text-brand-magenta uppercase tracking-wide shrink-0">Sign in</button>
-        </div>
+        <div id="account-status"></div>
 
         <div>
           <label class="block text-xs font-semibold text-slate-600 mb-1 flex items-center justify-between">
@@ -494,6 +488,29 @@
     return UNITS[type] === "hrs";
   }
 
+  // Defensive lookups: any activity key missing from LABELS/ICONS/UNITS/TARGETS
+  // (e.g. a legacy key from an older version of this app) falls back to a safe
+  // display value instead of rendering the literal string "undefined".
+  function activityMeta(type) {
+    return {
+      name: LABELS[type] || "Activity",
+      icon: ICONS[type] || "sports",
+      unit: UNITS[type] || ""
+    };
+  }
+
+  function activityTarget(targets, type) {
+    var t = targets ? targets[type] : undefined;
+    return (typeof t === "number" && isFinite(t)) ? t : 0;
+  }
+
+  // Legacy activity keys from earlier versions of this app, mapped onto the
+  // current canonical TYPES so old saved data never renders as "undefined".
+  var LEGACY_TYPE_ALIASES = { stretch: "movement" };
+  function normalizeActivityType(type) {
+    return LEGACY_TYPE_ALIASES[type] || type;
+  }
+
   function formatLoggedValue(type, value) {
     if (isTimeBased(type)) {
       var totalMinutes = Math.round(value * 60);
@@ -554,9 +571,36 @@
       if (!raw) return defaultState();
       var parsed = JSON.parse(raw);
       if (!parsed || !parsed.profile || !parsed.logs) return defaultState();
+      var migrated = false;
+
       // Migrate any pre-existing profile onto the sequential 4-digit scheme.
       if (!/^\d{4}$/.test(parsed.profile.raceNumber || "")) {
         parsed.profile.raceNumber = nextLocalRaceNumber();
+        migrated = true;
+      }
+
+      // Migrate legacy activity keys (e.g. "stretch" -> "movement") and drop
+      // anything unrecognized, so old saved data never renders as "undefined".
+      var cleanedActivities = (parsed.profile.activities || [])
+        .map(normalizeActivityType)
+        .filter(function (t) { return TYPES.indexOf(t) !== -1; });
+      if (!cleanedActivities.length) cleanedActivities = emptyProfile().activities;
+      if (JSON.stringify(cleanedActivities) !== JSON.stringify(parsed.profile.activities)) {
+        parsed.profile.activities = cleanedActivities;
+        migrated = true;
+      } else {
+        parsed.profile.activities = cleanedActivities;
+      }
+
+      var cleanedLogs = (parsed.logs || [])
+        .map(function (log) { return Object.assign({}, log, { type: normalizeActivityType(log.type) }); })
+        .filter(function (log) { return TYPES.indexOf(log.type) !== -1; });
+      if (cleanedLogs.length !== (parsed.logs || []).length || JSON.stringify(cleanedLogs) !== JSON.stringify(parsed.logs)) {
+        migrated = true;
+      }
+      parsed.logs = cleanedLogs;
+
+      if (migrated) {
         localStorage.setItem(STORAGE_KEY, JSON.stringify(parsed));
       }
       return parsed;
@@ -571,13 +615,16 @@
 
   // ---------- Supabase row <-> app-shape mapping ----------
   function mapProfileFromDb(row) {
+    var activities = (Array.isArray(row.selected_activities) ? row.selected_activities : TYPES.slice(0, 5))
+      .map(normalizeActivityType)
+      .filter(function (t) { return TYPES.indexOf(t) !== -1; });
     return {
       name: row.name || "",
       email: row.email || "",
       cell: row.phone || "",
       raceNumber: row.race_number || "----",
       challenge: row.challenge_type || "classic",
-      activities: Array.isArray(row.selected_activities) ? row.selected_activities : TYPES.slice(0, 5)
+      activities: activities.length ? activities : TYPES.slice(0, 5)
     };
   }
 
@@ -586,7 +633,7 @@
     return {
       id: row.id,
       date: row.logged_date,
-      type: row.sport_type,
+      type: normalizeActivityType(row.sport_type),
       value: timeBased ? (Number(row.duration_minutes) || 0) / 60 : (Number(row.distance_km) || 0),
       note: "" // activity_logs has no note column in this schema; notes are local-only.
     };
@@ -825,7 +872,8 @@
     var container = document.getElementById(containerId);
     container.innerHTML = "";
     state.profile.activities.forEach(function (type) {
-      var target = targets[type] || 0;
+      var meta = activityMeta(type);
+      var target = activityTarget(targets, type);
       var value = totals[type] || 0;
       var displayValue = Math.round(value * 10) / 10;
       var pct = target > 0 ? Math.min(100, (value / target) * 100) : 0;
@@ -833,10 +881,10 @@
       row.innerHTML =
         '<div class="flex items-center justify-between mb-1">' +
           '<div class="flex items-center gap-1.5">' +
-            '<span class="material-symbols-outlined text-brand-cyan text-[15px]">' + ICONS[type] + '</span>' +
-            '<span class="text-xs font-semibold text-white">' + LABELS[type] + '</span>' +
+            '<span class="material-symbols-outlined text-brand-cyan text-[15px]">' + meta.icon + '</span>' +
+            '<span class="text-xs font-semibold text-white">' + meta.name + '</span>' +
           '</div>' +
-          '<span class="text-[11px] text-muted tabular">' + displayValue + ' / ' + target + ' ' + UNITS[type] + '</span>' +
+          '<span class="text-[11px] text-muted tabular">' + displayValue + ' / ' + target + (meta.unit ? ' ' + meta.unit : '') + '</span>' +
         '</div>' +
         '<div class="h-1.5 rounded-full progress-track overflow-hidden">' +
           '<div class="h-full progress-fill rounded-full" style="width:' + pct + '%"></div>' +
@@ -945,7 +993,8 @@
 
       var tdType = document.createElement("td");
       tdType.className = "py-2.5 px-1";
-      tdType.innerHTML = '<span class="inline-flex items-center gap-1 text-white"><span class="material-symbols-outlined text-[14px] text-brand-cyan">' + ICONS[log.type] + '</span>' + LABELS[log.type] + '</span>';
+      var logMeta = activityMeta(log.type);
+      tdType.innerHTML = '<span class="inline-flex items-center gap-1 text-white"><span class="material-symbols-outlined text-[14px] text-brand-cyan">' + logMeta.icon + '</span>' + logMeta.name + '</span>';
       tr.appendChild(tdType);
 
       var tdValue = document.createElement("td");
@@ -972,23 +1021,40 @@
   }
 
   function renderAccountStatus() {
-    var icon = document.getElementById("account-status-icon");
-    var text = document.getElementById("account-status-text");
-    var actionBtn = document.getElementById("btn-account-action");
+    var el = document.getElementById("account-status");
 
     if (Store.mode !== "cloud") {
-      icon.textContent = "cloud_off";
-      text.textContent = "Local device only — add Supabase keys to sync";
-      actionBtn.textContent = "Learn more";
+      // No Supabase keys configured: a quiet, non-intrusive caption rather
+      // than a warning banner — there's nothing actionable for the user here.
+      el.className = "flex items-center gap-1 -mt-1";
+      el.innerHTML =
+        '<button id="btn-account-action" type="button" class="flex items-center gap-1 text-[11px] text-slate-400 hover:text-slate-500 transition-colors">' +
+          '<span class="material-symbols-outlined text-[13px]">cloud_off</span>' +
+          'Local mode' +
+        '</button>';
     } else if (currentUser) {
-      icon.textContent = "cloud_done";
-      text.textContent = "Synced as " + (currentUser.email || "");
-      actionBtn.textContent = "Log out";
+      // Configured and signed in: a sleek, compact "Cloud Synced" badge.
+      el.className = "flex items-center justify-between gap-2";
+      el.innerHTML =
+        '<span class="inline-flex items-center gap-1 px-2.5 py-1 rounded-full bg-emerald-50 border border-emerald-200">' +
+          '<span class="material-symbols-outlined text-[13px] text-emerald-600">cloud_done</span>' +
+          '<span class="text-[10px] font-bold uppercase tracking-wide text-emerald-700">Cloud Synced</span>' +
+        '</span>' +
+        '<button id="btn-account-action" type="button" class="text-[11px] font-bold text-brand-magenta uppercase tracking-wide">Log out</button>';
     } else {
-      icon.textContent = "cloud_off";
-      text.textContent = "Not signed in";
-      actionBtn.textContent = "Sign in";
+      // Configured but signed out: actionable, so it stays prominent.
+      el.className = "flex items-center justify-between gap-2 bg-slate-50 border border-slate-200 rounded-lg px-3 py-2.5";
+      el.innerHTML =
+        '<div class="flex items-center gap-1.5 min-w-0">' +
+          '<span class="material-symbols-outlined text-[16px] text-slate-500 shrink-0">cloud_off</span>' +
+          '<span class="text-xs font-semibold text-slate-600 truncate">Not signed in</span>' +
+        '</div>' +
+        '<button id="btn-account-action" type="button" class="text-[11px] font-bold text-brand-magenta uppercase tracking-wide shrink-0">Sign in</button>';
     }
+
+    // The button is recreated on every render, so (re)bind its handler here.
+    var actionBtn = document.getElementById("btn-account-action");
+    if (actionBtn) actionBtn.addEventListener("click", handleAccountAction);
   }
 
   function renderProfile() {
@@ -1017,9 +1083,10 @@
       btn.setAttribute("aria-pressed", selected ? "true" : "false");
       btn.className = "p-2.5 rounded-lg border-2 flex flex-col items-center gap-1 transition-colors " +
         (selected ? "bg-[#0F0C20] border-brand-cyan text-white" : "bg-slate-100 border-slate-200 text-slate-500 hover:text-slate-800");
+      var checkboxMeta = activityMeta(type);
       btn.innerHTML =
-        '<span class="material-symbols-outlined text-[22px] ' + (selected ? "text-brand-cyan" : "") + '">' + ICONS[type] + '</span>' +
-        '<span class="text-[11px] font-bold">' + LABELS[type] + '</span>';
+        '<span class="material-symbols-outlined text-[22px] ' + (selected ? "text-brand-cyan" : "") + '">' + checkboxMeta.icon + '</span>' +
+        '<span class="text-[11px] font-bold">' + checkboxMeta.name + '</span>';
       btn.addEventListener("click", function () {
         var idx = state.profile.activities.indexOf(type);
         if (idx === -1) state.profile.activities.push(type);
@@ -1082,7 +1149,7 @@
     available.forEach(function (type) {
       var opt = document.createElement("option");
       opt.value = type;
-      opt.textContent = LABELS[type];
+      opt.textContent = activityMeta(type).name;
       select.appendChild(opt);
     });
     select.value = selectedType && available.indexOf(selectedType) !== -1 ? selectedType : available[0];
@@ -1286,8 +1353,11 @@
     }
   });
 
-  // ---------- Account status action (Sign in / Log out / Learn more) ----------
-  document.getElementById("btn-account-action").addEventListener("click", async function () {
+  // ---------- Account status action (Sign in / Log out / Local mode info) ----------
+  // The button itself is recreated on every renderAccountStatus() call (its
+  // markup differs per state), so this is bound fresh each time rather than
+  // attached once at load — see the bottom of renderAccountStatus().
+  async function handleAccountAction() {
     if (Store.mode === "cloud" && currentUser) {
       await Store.signOut();
       renderAll();
@@ -1295,7 +1365,7 @@
     } else {
       openAuthModal();
     }
-  });
+  }
 
   // ---------- Init ----------
   async function boot() {
